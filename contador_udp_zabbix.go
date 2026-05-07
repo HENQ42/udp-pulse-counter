@@ -56,6 +56,7 @@ type config struct {
 	AllowedCIDRs  []*net.IPNet
 	Debug         bool
 	Cameras       []cameraSpec
+	MaxSourceIPs  int // limite por contador
 }
 
 // ----------------------------------------------------------------------------
@@ -89,11 +90,13 @@ type Counter struct {
 	PreviousActive bool
 	HasFirstPacket bool
 
-	// IPs de origem ja vistos (somente diagnostico)
-	SourceIPs map[string]time.Time
+	// mapa bounded de IPs de origem (somente diagnostico).
+	// Tamanho maximo controlado por MaxSourceIPs. Cheio -> evict do mais antigo.
+	SourceIPs    map[string]time.Time
+	MaxSourceIPs int
 }
 
-func newCounter(name string, port int, bucketSeconds int64) *Counter {
+func newCounter(name string, port int, bucketSeconds int64, maxSourceIPs int) *Counter {
 	now := time.Now().Unix()
 	bs := bucketStart(now, bucketSeconds)
 	return &Counter{
@@ -103,8 +106,32 @@ func newCounter(name string, port int, bucketSeconds int64) *Counter {
 		CurrentBucketStart: bs,
 		LastBucketStart:    bs - bucketSeconds, // bucket "anterior" sintetico (count=0)
 		LastBucketEnd:      bs,
-		SourceIPs:          map[string]time.Time{},
+		SourceIPs:          make(map[string]time.Time, maxSourceIPs),
+		MaxSourceIPs:       maxSourceIPs,
 	}
+}
+
+// touchSourceIPLocked atualiza/insere um IP respeitando MaxSourceIPs.
+// Quando cheio, descarta o IP com timestamp mais antigo. c.mu deve estar travado.
+func (c *Counter) touchSourceIPLocked(ip string, now time.Time) {
+	if _, ok := c.SourceIPs[ip]; ok {
+		c.SourceIPs[ip] = now
+		return
+	}
+	if c.MaxSourceIPs > 0 && len(c.SourceIPs) >= c.MaxSourceIPs {
+		var oldestKey string
+		var oldestTS time.Time
+		first := true
+		for k, t := range c.SourceIPs {
+			if first || t.Before(oldestTS) {
+				oldestKey = k
+				oldestTS = t
+				first = false
+			}
+		}
+		delete(c.SourceIPs, oldestKey)
+	}
+	c.SourceIPs[ip] = now
 }
 
 func bucketStart(ts int64, bucketSeconds int64) int64 {
@@ -215,6 +242,9 @@ func runUDPListener(cfg *config, c *Counter) error {
 	log.Printf("[UDP] camera=%s listening on %s:%d", c.Name, cfg.UDPHost, c.UDPPort)
 
 	go func() {
+		// Buffer fixo reutilizado: nao alocamos por pacote.
+		// handlePacket roda sincronamente nesta goroutine, entao buf[:n]
+		// pode ser usado direto sem corrida.
 		buf := make([]byte, 2048)
 		for {
 			n, src, err := pc.ReadFromUDP(buf)
@@ -222,9 +252,7 @@ func runUDPListener(cfg *config, c *Counter) error {
 				log.Printf("[UDP] camera=%s read error: %v", c.Name, err)
 				continue
 			}
-			payload := make([]byte, n)
-			copy(payload, buf[:n])
-			handlePacket(cfg, c, payload, src)
+			handlePacket(cfg, c, buf[:n], src)
 		}
 	}()
 	return nil
@@ -266,7 +294,7 @@ func handlePacket(cfg *config, c *Counter, data []byte, src *net.UDPAddr) {
 		c.PacketsReceived++
 		c.PacketsIgnored++
 		c.LastPacketAt = now
-		c.SourceIPs[src.IP.String()] = now
+		c.touchSourceIPLocked(src.IP.String(), now)
 		c.mu.Unlock()
 		return
 	}
@@ -701,6 +729,7 @@ func main() {
 	active := flag.String("active", "high", "modo do estado ativo: high|low")
 	authToken := flag.String("auth-token", "", "token de autorizacao para rotas HTTP (vazio = sem auth)")
 	debug := flag.Bool("debug", false, "logs detalhados de cada pacote UDP")
+	maxSourceIPs := flag.Int("max-source-ips", 64, "limite de IPs de origem rastreados por contador (eviction do mais antigo)")
 
 	flag.Var(&cameraFlags, "camera", "camera no formato nome:porta (pode repetir)")
 	flag.Var(&cidrFlags, "allowed-source-cidr", "CIDR permitido como origem UDP (pode repetir)")
@@ -711,6 +740,9 @@ func main() {
 
 	if *bucketSeconds <= 0 {
 		fatal("bucket-seconds deve ser > 0")
+	}
+	if *maxSourceIPs <= 0 {
+		fatal("max-source-ips deve ser > 0")
 	}
 	if *active != "high" && *active != "low" {
 		fatal("active deve ser high ou low")
@@ -747,6 +779,7 @@ func main() {
 		AllowedCIDRs:  cidrs,
 		Debug:         *debug,
 		Cameras:       cams,
+		MaxSourceIPs:  *maxSourceIPs,
 	}
 
 	log.Printf("[CFG] bucket_seconds=%d active=%s auth_enabled=%v", cfg.BucketSeconds, cfg.ActiveMode, cfg.AuthToken != "")
@@ -756,7 +789,7 @@ func main() {
 
 	counters := []*Counter{}
 	for _, cs := range cams {
-		c := newCounter(cs.Name, cs.Port, int64(cfg.BucketSeconds))
+		c := newCounter(cs.Name, cs.Port, int64(cfg.BucketSeconds), cfg.MaxSourceIPs)
 		counters = append(counters, c)
 		if err := runUDPListener(cfg, c); err != nil {
 			fatal(err.Error())
