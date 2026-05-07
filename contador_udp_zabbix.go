@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -246,13 +247,25 @@ func runUDPListener(cfg *config, c *Counter) error {
 		// handlePacket roda sincronamente nesta goroutine, entao buf[:n]
 		// pode ser usado direto sem corrida.
 		buf := make([]byte, 2048)
+
+		// Loop com recover por iteracao: um panic no processamento de UM pacote
+		// nao derruba o listener (e nao derruba o processo inteiro).
+		// O socket UDP eh preservado entre iteracoes.
 		for {
-			n, src, err := pc.ReadFromUDP(buf)
-			if err != nil {
-				log.Printf("[UDP] camera=%s read error: %v", c.Name, err)
-				continue
-			}
-			handlePacket(cfg, c, buf[:n], src)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[UDP] camera=%s PANIC recuperado: %v\n%s",
+							c.Name, r, debug.Stack())
+					}
+				}()
+				n, src, err := pc.ReadFromUDP(buf)
+				if err != nil {
+					log.Printf("[UDP] camera=%s read error: %v", c.Name, err)
+					return
+				}
+				handlePacket(cfg, c, buf[:n], src)
+			}()
 		}
 	}()
 	return nil
@@ -272,6 +285,7 @@ func sourceAllowed(cfg *config, ip net.IP) bool {
 
 func handlePacket(cfg *config, c *Counter, data []byte, src *net.UDPAddr) {
 	now := time.Now()
+	srcIP := src.IP.String()
 
 	if !sourceAllowed(cfg, src.IP) {
 		if cfg.Debug {
@@ -279,8 +293,8 @@ func handlePacket(cfg *config, c *Counter, data []byte, src *net.UDPAddr) {
 				c.Name, c.UDPPort, src.String())
 		}
 		c.mu.Lock()
+		defer c.mu.Unlock()
 		c.PacketsIgnored++
-		c.mu.Unlock()
 		return
 	}
 
@@ -291,11 +305,11 @@ func handlePacket(cfg *config, c *Counter, data []byte, src *net.UDPAddr) {
 				c.Name, c.UDPPort, src.String(), hex.EncodeToString(data))
 		}
 		c.mu.Lock()
+		defer c.mu.Unlock()
 		c.PacketsReceived++
 		c.PacketsIgnored++
 		c.LastPacketAt = now
-		c.touchSourceIPLocked(src.IP.String(), now)
-		c.mu.Unlock()
+		c.touchSourceIPLocked(srcIP, now)
 		return
 	}
 
@@ -306,32 +320,39 @@ func handlePacket(cfg *config, c *Counter, data []byte, src *net.UDPAddr) {
 		active = !rawActive
 	}
 
-	c.mu.Lock()
-	c.rotateLocked(now.Unix())
-	c.PacketsReceived++
-	c.LastPacketAt = now
-	c.SourceIPs[src.IP.String()] = now
+	// Secao critica isolada em closure com defer Unlock:
+	// se houver panic aqui dentro, o mutex e liberado antes do panic propagar
+	// para o recover() do listener.
+	status := func() string {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 
-	status := "INACTIVE"
-	if !c.HasFirstPacket {
-		// Apenas sincroniza estado anterior, nao conta.
-		c.PreviousActive = active
-		c.HasFirstPacket = true
-		status = "FIRST_PACKET_SYNC"
-	} else {
+		c.rotateLocked(now.Unix())
+		c.PacketsReceived++
+		c.LastPacketAt = now
+		c.touchSourceIPLocked(srcIP, now)
+
+		if !c.HasFirstPacket {
+			// Apenas sincroniza estado anterior, nao conta.
+			c.PreviousActive = active
+			c.HasFirstPacket = true
+			return "FIRST_PACKET_SYNC"
+		}
+
+		var s string
 		if active && !c.PreviousActive {
 			c.CurrentCount++
 			c.Total++
 			c.LastEventAt = now
-			status = "COUNTED"
+			s = "COUNTED"
 		} else if active && c.PreviousActive {
-			status = "IGNORED_SAME_PULSE"
-		} else if !active {
-			status = "INACTIVE"
+			s = "IGNORED_SAME_PULSE"
+		} else {
+			s = "INACTIVE"
 		}
 		c.PreviousActive = active
-	}
-	c.mu.Unlock()
+		return s
+	}()
 
 	if cfg.Debug {
 		log.Printf("[UDP] camera=%s port=%d src=%s hex=%q val=%d active=%v status=%s",
@@ -723,7 +744,7 @@ func main() {
 	)
 
 	httpHost := flag.String("http-host", "0.0.0.0", "IP de bind do servidor HTTP")
-	httpPort := flag.Int("http-port", 8080, "porta HTTP")
+	httpPort := flag.Int("http-port", 23187, "porta HTTP")
 	udpHost := flag.String("udp-host", "0.0.0.0", "IP de bind dos listeners UDP")
 	bucketSeconds := flag.Int("bucket-seconds", 60, "tamanho do periodo de agrupamento em segundos")
 	active := flag.String("active", "high", "modo do estado ativo: high|low")

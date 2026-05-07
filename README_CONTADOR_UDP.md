@@ -30,9 +30,9 @@ biblioteca padrão do Go.
 ## Arquitetura
 
 ```
- cam Entrada ──UDP:5001──┐
- cam Saída   ──UDP:5002──┤      ┌──────────────────────────┐
- cam Pátio   ──UDP:5003──┼──►   │  contador_udp_zabbix     │
+ cam Entrada ──UDP:19000──┐
+ cam Saída   ──UDP:19001──┤      ┌──────────────────────────┐
+ cam Pátio   ──UDP:19002──┼──►   │  contador_udp_zabbix     │
                          │      │                          │
                          │      │  - 1 listener UDP/porta  │
                          │      │  - 1 Counter/listener    │
@@ -65,9 +65,9 @@ roteador ou link compartilhado. Por isso a identidade da câmera **não é** o
 IP de origem, e sim a **porta UDP local** onde ela envia o pulso.
 
 ```
-cam entrada ─► servidor:5001
-cam saída   ─► servidor:5002
-cam pátio   ─► servidor:5003
+cam entrada ─► servidor:19000
+cam saída   ─► servidor:19001
+cam pátio   ─► servidor:19002
 ```
 
 Mesmo que todas saiam do mesmo IP público, o serviço separa pela porta
@@ -140,29 +140,29 @@ go build -o contador_udp_zabbix contador_udp_zabbix.go
 
 # três câmeras nomeadas
 ./contador_udp_zabbix \
-  --camera entrada:5001 \
-  --camera saida:5002 \
-  --camera patio:5003 \
-  --http-port 8080 \
+  --camera entrada:19000 \
+  --camera saida:19001 \
+  --camera patio:19002 \
+  --http-port 23187 \
   --bucket-seconds 60 \
   --active high \
   --auth-token "meu-token-secreto" \
   --debug
 
-# range de portas (gera cam5001..cam5005)
+# range de portas (gera cam19000..cam19049)
 ./contador_udp_zabbix \
-  --port-range 5001-5005 \
+  --port-range 19000-19049 \
   --counter-prefix cam \
-  --http-port 8080 \
+  --http-port 23187 \
   --bucket-seconds 60 \
   --active high \
   --auth-token "meu-token-secreto"
 
 # range + filtro de origem
 ./contador_udp_zabbix \
-  --port-range 5001-5005 \
+  --port-range 19000-19049 \
   --counter-prefix cam \
-  --http-port 8080 \
+  --http-port 23187 \
   --auth-token "meu-token-secreto" \
   --allowed-source-cidr 192.168.0.0/16 \
   --allowed-source-cidr 10.0.0.0/8
@@ -175,13 +175,13 @@ go build -o contador_udp_zabbix contador_udp_zabbix.go
 | Flag | Default | Descrição |
 |---|---|---|
 | `--http-host` | `0.0.0.0` | Bind HTTP |
-| `--http-port` | `8080` | Porta HTTP |
+| `--http-port` | `23187` | Porta HTTP |
 | `--udp-host` | `0.0.0.0` | Bind UDP |
 | `--bucket-seconds` | `60` | Tamanho do bucket em segundos |
 | `--active` | `high` | `high` ou `low` |
 | `--auth-token` | (vazio) | Token de autorização. Vazio = sem auth |
 | `--camera` | — | `nome:porta`, pode repetir |
-| `--port-range` | — | `inicio-fim`, ex: `5001-5005` |
+| `--port-range` | — | `inicio-fim`, ex: `19000-19049` |
 | `--counter-prefix` | `cam` | Prefixo de nome para `--port-range` |
 | `--allowed-source-cidr` | — | CIDR permitido como origem (pode repetir) |
 | `--debug` | `false` | Loga cada pacote recebido |
@@ -223,33 +223,33 @@ token).
 
 ```bash
 # saúde
-curl http://SERVIDOR:8080/health
+curl http://SERVIDOR:23187/health
 
 # valor da câmera (recomendado p/ Zabbix)
 curl -H "Authorization: Bearer meu-token-secreto" \
-  http://SERVIDOR:8080/zabbix/cam5001/last/value
+  http://SERVIDOR:23187/zabbix/cam19000/last/value
 # => 12
 
 # JSON da câmera
 curl -H "Authorization: Bearer meu-token-secreto" \
-  http://SERVIDOR:8080/zabbix/cam5001/last
+  http://SERVIDOR:23187/zabbix/cam19000/last
 
 # por IP de origem (todos os listeners onde aquele IP apareceu)
 curl -H "Authorization: Bearer meu-token-secreto" \
-  http://SERVIDOR:8080/zabbix/ip/192.168.1.20/last
+  http://SERVIDOR:23187/zabbix/ip/192.168.1.20/last
 
 # por IP em texto puro
 curl -H "Authorization: Bearer meu-token-secreto" \
-  http://SERVIDOR:8080/zabbix/ip/192.168.1.20/last/value
-# => 5001=12
-#    5002=4
+  http://SERVIDOR:23187/zabbix/ip/192.168.1.20/last/value
+# => 19000=12
+#    19001=4
 
 # debug
 curl -H "X-Auth-Token: meu-token-secreto" \
-  http://SERVIDOR:8080/debug
+  http://SERVIDOR:23187/debug
 
 # query string (apenas para teste — desencorajado em produção)
-curl "http://SERVIDOR:8080/zabbix/cam5001/last/value?token=meu-token-secreto"
+curl "http://SERVIDOR:23187/zabbix/cam19000/last/value?token=meu-token-secreto"
 ```
 
 #### Resposta de `/zabbix/ip/{ip}/last`
@@ -261,8 +261,8 @@ curl "http://SERVIDOR:8080/zabbix/cam5001/last/value?token=meu-token-secreto"
   "bucket_seconds": 60,
   "matches": [
     {
-      "camera": "cam5001",
-      "udp_port": 5001,
+      "camera": "cam19000",
+      "udp_port": 19000,
       "bucket_seconds": 60,
       "bucket_start_ts": 1778167140,
       "bucket_end_ts": 1778167200,
@@ -309,9 +309,9 @@ Cada câmera Pumatronix/ITSCAM deve ser configurada para enviar o pulso
 UDP para o IP do servidor e para uma **porta única** por câmera.
 
 ```
-cam Entrada → servidor:5001
-cam Saída   → servidor:5002
-cam Pátio   → servidor:5003
+cam Entrada → servidor:19000
+cam Saída   → servidor:19001
+cam Pátio   → servidor:19002
 ```
 
 Não importa se duas câmeras chegam com o mesmo IP de origem (NAT/VPN): o
@@ -328,7 +328,7 @@ Se quiser restringir quem pode enviar, use `--allowed-source-cidr`. Isto é
 
 - Tipo: **HTTP Agent**
 - Método: `GET`
-- URL: `http://SERVIDOR:8080/zabbix/cam5001/last/value`
+- URL: `http://SERVIDOR:23187/zabbix/cam19000/last/value`
 - Headers: `Authorization: Bearer meu-token-secreto`
 - Tipo de informação: **Numeric (unsigned)**
 - Intervalo: `60s`
