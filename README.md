@@ -13,14 +13,14 @@ go build -o contador_udp_zabbix contador_udp_zabbix.go
 ## Rodar
 
 ```bash
-./contador_udp_zabbix --port-range 4100-4149 \
+./contador_udp_zabbix --port-range 5000-5049 \
   --http-host 127.0.0.1 --http-port 23187
 ```
 
 Teste:
 
 ```bash
-curl http://127.0.0.1:23187/zabbix/cam4100/last/value
+curl http://127.0.0.1:23187/zabbix/cam5000/last/value
 ```
 
 ## Flags
@@ -68,11 +68,11 @@ O script:
   `/etc/sysctl.d/99-contador-udp.conf`).
 - Compila o binário (`CGO_ENABLED=0 -ldflags="-s -w"`).
 - Instala em `/opt/contador-udp/` como `root:root` com modo `0755`.
-- Reserva o range UDP `4100-4149` via sysctl
+- Reserva o range UDP `5000-5049` via sysctl
   (`net.ipv4.ip_local_reserved_ports`).
 - Cria o unit com hardening (`User=nobody`, `ProtectSystem=strict`,
   `NoNewPrivileges`, etc.), defaults:
-  `--http-host 127.0.0.1 --http-port 23187 --port-range 4100-4149`.
+  `--http-host 127.0.0.1 --http-port 23187 --port-range 5000-5049`.
 - HTTP fica **localhost-only** (Zabbix consulta no próprio servidor),
   por isso a aplicação roda sem token de autorização.
 - `daemon-reload`, `enable` e `restart`.
@@ -107,7 +107,7 @@ curl http://127.0.0.1:23187/health
    Type=simple
    User=nobody
    ExecStart=/opt/contador-udp/contador_udp_zabbix \
-     --port-range 4100-4149 \
+     --port-range 5000-5049 \
      --counter-prefix cam \
      --http-host 127.0.0.1 \
      --http-port 23187 \

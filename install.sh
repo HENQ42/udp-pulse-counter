@@ -30,7 +30,7 @@ readonly LEGACY_TOKEN_FILE="${LEGACY_TOKEN_DIR}/token.env"
 readonly DEFAULT_HTTP_HOST="127.0.0.1"
 
 # Defaults da aplicacao
-readonly DEFAULT_PORT_RANGE="4100-4149"
+readonly DEFAULT_PORT_RANGE="5000-5049"
 readonly DEFAULT_HTTP_PORT="23187"
 readonly DEFAULT_BUCKET_SECONDS="60"
 readonly DEFAULT_ACTIVE="high"
@@ -283,7 +283,7 @@ print_summary() {
     echo "  Sysctl         : ${SYSCTL_FILE}"
     echo "  Range UDP      : ${DEFAULT_PORT_RANGE}"
     echo "  HTTP           : ${DEFAULT_HTTP_HOST}:${DEFAULT_HTTP_PORT} (localhost-only, sem auth)"
-    echo "  Prefixo nomes  : ${DEFAULT_PREFIX} -> cam4100..cam4149"
+    echo "  Prefixo nomes  : ${DEFAULT_PREFIX} -> cam5000..cam5049"
     echo
     echo "Comandos uteis:"
     echo "  systemctl status ${APP_NAME}"
