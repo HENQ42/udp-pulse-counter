@@ -22,6 +22,12 @@ readonly INSTALL_DIR="/opt/${APP_NAME}"
 readonly INSTALL_BIN="${INSTALL_DIR}/${BIN_NAME}"
 readonly UNIT_FILE="/etc/systemd/system/${APP_NAME}.service"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-${APP_NAME}.conf"
+# Diretorios/arquivos de instalacoes antigas (limpeza apenas)
+readonly LEGACY_TOKEN_DIR="/etc/${APP_NAME}"
+readonly LEGACY_TOKEN_FILE="${LEGACY_TOKEN_DIR}/token.env"
+
+# Bind HTTP: localhost-only por padrao (Zabbix no proprio servidor).
+readonly DEFAULT_HTTP_HOST="127.0.0.1"
 
 # Defaults da aplicacao
 readonly DEFAULT_PORT_RANGE="19000-19049"
@@ -32,6 +38,24 @@ readonly DEFAULT_PREFIX="cam"
 
 # Caminho absoluto da raiz do projeto (onde este script vive)
 readonly PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+    cat <<EOF
+Uso: sudo $0 [-h|--help]
+
+Instala/atualiza o ${APP_NAME} como servico systemd.
+HTTP escuta apenas em 127.0.0.1 — sem necessidade de token.
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) usage; exit 0;;
+            *) die "argumento desconhecido: $1 (use --help)";;
+        esac
+    done
+}
 
 # ---------------------------------------------------------------------------
 # Helpers de log
@@ -147,6 +171,17 @@ clean_previous_install() {
         warn "removido: ${SYSCTL_FILE}"
         removed=1
     fi
+    # Legado: instalacoes anteriores que usavam token.
+    if [[ -f "${LEGACY_TOKEN_FILE}" ]]; then
+        rm -f "${LEGACY_TOKEN_FILE}"
+        warn "removido (legado): ${LEGACY_TOKEN_FILE}"
+        removed=1
+    fi
+    if [[ -d "${LEGACY_TOKEN_DIR}" ]] && [[ -z "$(ls -A "${LEGACY_TOKEN_DIR}")" ]]; then
+        rmdir "${LEGACY_TOKEN_DIR}"
+        warn "removido (legado, vazio): ${LEGACY_TOKEN_DIR}"
+        removed=1
+    fi
 
     if [[ "${removed}" -eq 0 ]]; then
         ok "nada para limpar"
@@ -198,6 +233,7 @@ Group=nogroup
 ExecStart=${INSTALL_BIN} \\
   --port-range ${DEFAULT_PORT_RANGE} \\
   --counter-prefix ${DEFAULT_PREFIX} \\
+  --http-host ${DEFAULT_HTTP_HOST} \\
   --http-port ${DEFAULT_HTTP_PORT} \\
   --bucket-seconds ${DEFAULT_BUCKET_SECONDS} \\
   --active ${DEFAULT_ACTIVE}
@@ -246,7 +282,7 @@ print_summary() {
     echo "  Unit           : ${UNIT_FILE}"
     echo "  Sysctl         : ${SYSCTL_FILE}"
     echo "  Range UDP      : ${DEFAULT_PORT_RANGE}"
-    echo "  Porta HTTP     : ${DEFAULT_HTTP_PORT}"
+    echo "  HTTP           : ${DEFAULT_HTTP_HOST}:${DEFAULT_HTTP_PORT} (localhost-only, sem auth)"
     echo "  Prefixo nomes  : ${DEFAULT_PREFIX} -> cam19000..cam19049"
     echo
     echo "Comandos uteis:"
@@ -279,4 +315,5 @@ main() {
     print_summary
 }
 
-main "$@"
+parse_args "$@"
+main

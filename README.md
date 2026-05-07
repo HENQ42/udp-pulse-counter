@@ -13,15 +13,14 @@ go build -o contador_udp_zabbix contador_udp_zabbix.go
 ## Rodar
 
 ```bash
-./contador_udp_zabbix --port-range 19000-19049 --http-port 23187 \
-  --auth-token "meu-token-secreto"
+./contador_udp_zabbix --port-range 19000-19049 \
+  --http-host 127.0.0.1 --http-port 23187
 ```
 
 Teste:
 
 ```bash
-curl -H "Authorization: Bearer meu-token-secreto" \
-  http://127.0.0.1:23187/zabbix/cam19000/last/value
+curl http://127.0.0.1:23187/zabbix/cam19000/last/value
 ```
 
 ## Flags
@@ -36,7 +35,7 @@ curl -H "Authorization: Bearer meu-token-secreto" \
 | `--udp-host` | `0.0.0.0` | Bind UDP |
 | `--bucket-seconds` | `60` | Tamanho do bucket (Zabbix lê o último fechado) |
 | `--active` | `high` | `high` = !=0 é ativo; `low` inverte |
-| `--auth-token` | (vazio) | Token; vazio desativa auth |
+| `--auth-token` | (vazio) | Token de auth HTTP. Não necessário se HTTP estiver em `127.0.0.1` |
 | `--allowed-source-cidr` | — | Filtra IPs de origem; pode repetir |
 | `--debug` | `false` | Loga cada pacote recebido |
 
@@ -72,7 +71,10 @@ O script:
 - Reserva o range UDP `19000-19049` via sysctl
   (`net.ipv4.ip_local_reserved_ports`).
 - Cria o unit com hardening (`User=nobody`, `ProtectSystem=strict`,
-  `NoNewPrivileges`, etc.), defaults: `--port-range 19000-19049 --http-port 23187`.
+  `NoNewPrivileges`, etc.), defaults:
+  `--http-host 127.0.0.1 --http-port 23187 --port-range 19000-19049`.
+- HTTP fica **localhost-only** (Zabbix consulta no próprio servidor),
+  por isso a aplicação roda sem token de autorização.
 - `daemon-reload`, `enable` e `restart`.
 - Idempotente: rodar de novo apenas atualiza.
 
@@ -105,12 +107,12 @@ curl http://127.0.0.1:23187/health
    Type=simple
    User=nobody
    ExecStart=/opt/contador-udp/contador_udp_zabbix \
-     --port-range 5000-5050 \
+     --port-range 19000-19049 \
      --counter-prefix cam \
+     --http-host 127.0.0.1 \
      --http-port 23187 \
      --bucket-seconds 60 \
-     --active high \
-     --auth-token meu-token-secreto
+     --active high
    Restart=always
    RestartSec=3
 
