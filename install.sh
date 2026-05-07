@@ -32,7 +32,7 @@ readonly DEFAULT_HTTP_HOST="127.0.0.1"
 # Defaults da aplicacao
 readonly DEFAULT_PORT_RANGE="5000-5049"
 readonly DEFAULT_HTTP_PORT="23187"
-readonly DEFAULT_BUCKET_SECONDS="60"
+readonly DEFAULT_BUCKET_SECONDS="900"
 readonly DEFAULT_ACTIVE="high"
 readonly DEFAULT_PREFIX="cam"
 
