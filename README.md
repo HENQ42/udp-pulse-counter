@@ -52,6 +52,40 @@ curl -H "Authorization: Bearer meu-token-secreto" \
 
 ## Instalar como serviço (systemd)
 
+### Modo automático (recomendado)
+
+Use o script `install.sh`. Requer Go já instalado e roda como root:
+
+```bash
+sudo ./install.sh
+```
+
+O script:
+
+- Verifica que é Ubuntu/Debian com systemd e Go disponível.
+- Para o serviço se já estiver rodando.
+- Limpa apenas arquivos do próprio projeto (`/opt/contador-udp/`,
+  `/etc/systemd/system/contador-udp.service`,
+  `/etc/sysctl.d/99-contador-udp.conf`).
+- Compila o binário (`CGO_ENABLED=0 -ldflags="-s -w"`).
+- Instala em `/opt/contador-udp/` como `root:root` com modo `0755`.
+- Reserva o range UDP `19000-19049` via sysctl
+  (`net.ipv4.ip_local_reserved_ports`).
+- Cria o unit com hardening (`User=nobody`, `ProtectSystem=strict`,
+  `NoNewPrivileges`, etc.), defaults: `--port-range 19000-19049 --http-port 23187`.
+- `daemon-reload`, `enable` e `restart`.
+- Idempotente: rodar de novo apenas atualiza.
+
+Verifique:
+
+```bash
+systemctl status contador-udp
+journalctl -u contador-udp -f
+curl http://127.0.0.1:23187/health
+```
+
+### Modo manual
+
 1. Copie o binário para um diretório do sistema:
 
    ```bash
