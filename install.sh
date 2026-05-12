@@ -258,12 +258,44 @@ install_binary() {
     ok "binario instalado"
 }
 
+# Em sistemas com SELinux ativo (RHEL/Rocky/Alma/Fedora), aplica os labels
+# default do filesystem nos arquivos recem-instalados. Sem isso, o binario
+# fica com o contexto herdado do build (ex: user_home_t) e o systemd pode
+# ser bloqueado ao tentar executa-lo.
+apply_selinux_labels() {
+    # Se nao tem getenforce/restorecon, nao e sistema com SELinux: sai limpo.
+    if ! command -v getenforce >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local mode
+    mode="$(getenforce 2>/dev/null || echo Disabled)"
+    if [[ "${mode}" == "Disabled" ]]; then
+        ok "SELinux desabilitado — nada a fazer"
+        return 0
+    fi
+
+    log "SELinux em modo ${mode}; aplicando contextos default..."
+    if ! command -v restorecon >/dev/null 2>&1; then
+        warn "restorecon nao encontrado (instale 'policycoreutils') — pulando"
+        return 0
+    fi
+
+    # Diretorio de instalacao + binario + unit + sysctl. restorecon e
+    # idempotente e nao falha se o caminho ja estiver correto.
+    restorecon -F "${INSTALL_DIR}"  >/dev/null 2>&1 || true
+    restorecon -F "${INSTALL_BIN}"  >/dev/null 2>&1 || true
+    restorecon -F "${UNIT_FILE}"    >/dev/null 2>&1 || true
+    restorecon -F "${SYSCTL_FILE}"  >/dev/null 2>&1 || true
+    ok "labels SELinux aplicados"
+}
+
 install_sysctl() {
     log "configurando sysctl para reservar portas ${DEFAULT_PORT_RANGE}..."
     cat > "${SYSCTL_FILE}" <<EOF
 # Reserva as portas usadas pelo ${APP_NAME} para que o kernel nao as
 # entregue como ephemeral a outros processos.
-net.ipv4.ip_local_reserved_ports = ${DEFAULT_PORT_RANGE//-/-}
+net.ipv4.ip_local_reserved_ports = ${DEFAULT_PORT_RANGE}
 EOF
     chmod 0644 "${SYSCTL_FILE}"
     sysctl --system >/dev/null
@@ -276,6 +308,8 @@ install_unit() {
 [Unit]
 Description=Contador UDP -> Zabbix
 After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -290,8 +324,6 @@ ExecStart=${INSTALL_BIN} \\
   --active ${DEFAULT_ACTIVE}
 Restart=always
 RestartSec=3
-StartLimitIntervalSec=60
-StartLimitBurst=10
 
 # Hardening basico: nao precisa de privilegio elevado nem escrita em disco.
 NoNewPrivileges=true
@@ -363,6 +395,7 @@ main() {
     install_binary
     install_sysctl
     install_unit
+    apply_selinux_labels
     enable_and_start
     print_summary
 }
