@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # install.sh
 #
-# Instala o contador-udp-zabbix como servico systemd no Ubuntu.
+# Instala o contador-udp-zabbix como servico systemd.
+# Distros suportadas: Ubuntu/Debian e Red Hat Enterprise Linux 9 (x86_64)
+# e derivados (Rocky, AlmaLinux, CentOS Stream 9).
 #
 # - Requer Go ja instalado (nao tenta instalar).
 # - Requer root (usa systemctl, escreve em /opt e /etc/systemd/system).
@@ -38,6 +40,11 @@ readonly DEFAULT_PREFIX="cam"
 
 # Caminho absoluto da raiz do projeto (onde este script vive)
 readonly PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Grupo do usuario "nobody". Em Debian/Ubuntu e "nogroup"; em RHEL e "nobody".
+# Definido em runtime por detect_service_group().
+SERVICE_USER="nobody"
+SERVICE_GROUP=""
 
 usage() {
     cat <<EOF
@@ -79,19 +86,63 @@ require_root() {
     fi
 }
 
-require_linux_ubuntu() {
+require_linux_supported() {
     log "verificando SO..."
     [[ "$(uname -s)" == "Linux" ]] || die "este script e apenas para Linux"
     [[ -r /etc/os-release ]]       || die "/etc/os-release nao encontrado"
 
+    local arch
+    arch="$(uname -m)"
+    if [[ "${arch}" != "x86_64" && "${arch}" != "amd64" ]]; then
+        die "arquitetura nao suportada: ${arch} (esperado x86_64)"
+    fi
+
     # shellcheck disable=SC1091
     . /etc/os-release
     local id="${ID:-}" id_like="${ID_LIKE:-}"
-    if [[ "${id}" != "ubuntu" && "${id}" != "debian" \
-          && "${id_like}" != *"ubuntu"* && "${id_like}" != *"debian"* ]]; then
-        die "distro nao suportada (esperado Ubuntu/Debian, achei: ${id})"
+    local supported=0
+
+    # Debian / Ubuntu
+    if [[ "${id}" == "ubuntu" || "${id}" == "debian" \
+          || "${id_like}" == *"ubuntu"* || "${id_like}" == *"debian"* ]]; then
+        supported=1
     fi
-    ok "SO: ${PRETTY_NAME:-$id}"
+
+    # RHEL 9 e derivados (Rocky, AlmaLinux, CentOS Stream, Fedora)
+    if [[ "${id}" == "rhel" || "${id}" == "rocky" || "${id}" == "almalinux" \
+          || "${id}" == "centos" || "${id}" == "fedora" \
+          || "${id_like}" == *"rhel"* || "${id_like}" == *"fedora"* ]]; then
+        supported=1
+        # Aviso (nao bloqueia) se nao for major 9 em distros tipo RHEL
+        local major="${VERSION_ID%%.*}"
+        if [[ "${id}" == "rhel" || "${id_like}" == *"rhel"* ]]; then
+            if [[ -n "${major}" && "${major}" != "9" ]]; then
+                warn "testado em RHEL 9; achei major=${major} — prosseguindo"
+            fi
+        fi
+    fi
+
+    if [[ "${supported}" -ne 1 ]]; then
+        die "distro nao suportada (esperado Ubuntu/Debian ou RHEL 9, achei: ${id})"
+    fi
+
+    ok "SO: ${PRETTY_NAME:-$id} (${arch})"
+}
+
+# Define SERVICE_GROUP de acordo com a distro:
+#   - Debian/Ubuntu: "nogroup"
+#   - RHEL/Fedora:   "nobody"
+# Faz fallback olhando /etc/group para nao depender so do ID.
+detect_service_group() {
+    log "detectando grupo do usuario '${SERVICE_USER}'..."
+    if getent group nogroup >/dev/null 2>&1; then
+        SERVICE_GROUP="nogroup"
+    elif getent group nobody >/dev/null 2>&1; then
+        SERVICE_GROUP="nobody"
+    else
+        die "nem grupo 'nogroup' nem 'nobody' encontrados em /etc/group"
+    fi
+    ok "grupo do servico: ${SERVICE_GROUP}"
 }
 
 require_paths_exist() {
@@ -228,8 +279,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=nobody
-Group=nogroup
+User=${SERVICE_USER}
+Group=${SERVICE_GROUP}
 ExecStart=${INSTALL_BIN} \\
   --port-range ${DEFAULT_PORT_RANGE} \\
   --counter-prefix ${DEFAULT_PREFIX} \\
@@ -298,9 +349,10 @@ print_summary() {
 # ---------------------------------------------------------------------------
 main() {
     require_root
-    require_linux_ubuntu
+    require_linux_supported
     require_paths_exist
     require_systemd
+    detect_service_group
     require_go
     require_source
 
