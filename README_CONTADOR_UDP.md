@@ -2,8 +2,12 @@
 
 Serviço em Go (arquivo único `contador_udp_zabbix.go`) que recebe pulsos UDP
 de câmeras Pumatronix/ITSCAM (ou equivalentes), conta veículos por **borda de
-pulso** (transição inativo → ativo), agrupa por minuto fechado e expõe rotas
-HTTP GET para o Zabbix coletar.
+pulso** (transição inativo → ativo) e expõe um **contador monotônico** via
+HTTP. O Zabbix calcula o delta por intervalo com preprocessing
+**Simple change**.
+
+O estado é **persistido em JSON** (snapshot periódico + flush em SIGTERM), de
+modo que reinícios do processo não zeram a contagem.
 
 Sem banco, sem Redis, sem Prometheus, sem framework externo. Apenas a
 biblioteca padrão do Go.
@@ -15,6 +19,7 @@ biblioteca padrão do Go.
 - [Arquitetura](#arquitetura)
 - [Por que separar por porta UDP](#por-que-separar-por-porta-udp)
 - [Lógica de contagem](#lógica-de-contagem)
+- [Persistência](#persistência)
 - [Parsing dos pacotes](#parsing-dos-pacotes)
 - [Como rodar](#como-rodar)
 - [Flags](#flags)
@@ -36,8 +41,8 @@ biblioteca padrão do Go.
                          │      │                          │
                          │      │  - 1 listener UDP/porta  │
                          │      │  - 1 Counter/listener    │
-                         │      │  - bucket atual + último │
-                         │      │    bucket fechado em RAM │
+                         │      │  - Total monotônico      │
+                         │      │  - state.json (snapshot) │
                          │      │                          │
                          │      │  HTTP /zabbix/...  ──► Zabbix HTTP Agent
                          │      └──────────────────────────┘
@@ -45,16 +50,15 @@ biblioteca padrão do Go.
 
 Cada câmera/contador tem um `Counter` próprio com mutex próprio. Cada porta
 UDP roda em sua própria goroutine. O servidor HTTP roda no processo
-principal.
+principal. Uma goroutine adicional faz o snapshot periódico do estado.
 
 Em RAM, por contador:
 
-- nome, porta UDP, tamanho do bucket (segundos)
-- bucket atual (start + count)
-- último bucket fechado (start + end + count)
-- total geral, pacotes recebidos/ignorados
+- nome, porta UDP
+- `Total` (contador monotônico de eventos)
+- `PacketsReceived` / `PacketsIgnored` (diagnóstico)
 - estado anterior (ativo/inativo) e flag de "primeiro pacote já recebido"
-- mapa de IPs de origem já vistos neste listener (somente diagnóstico)
+- mapa bounded de IPs de origem já vistos neste listener (diagnóstico)
 
 ---
 
@@ -98,19 +102,67 @@ evita falso positivo se o serviço iniciar no meio de um pulso.
 > resolve o caso normal; usar gap mínimo poderia esconder veículos reais em
 > fluxo intenso.
 
-### Bucket / período
+### Contador monotônico
 
-O Zabbix consulta o **último bucket fechado**, nunca o atual.
+`Total` é incrementado a cada borda contada e **nunca decrementa em runtime**.
+A rota HTTP devolve o valor absoluto atual. O Zabbix calcula a diferença
+entre coletas com preprocessing **Simple change**.
 
 ```
-agora            = 14:32:20
-bucket atual     = 14:32:00 .. 14:32:59  (incompleto)
-último fechado   = 14:31:00 .. 14:31:59  ◄── /zabbix/.../last/value retorna isto
+t0  GET /zabbix/cam5000/total/value  ─►  184523
+t1  GET /zabbix/cam5000/total/value  ─►  184537   (Simple change → 14 carros)
+t2  GET /zabbix/cam5000/total/value  ─►  184537   (Simple change →  0 carros)
+t3  GET /zabbix/cam5000/total/value  ─►  184562   (Simple change → 25 carros)
 ```
 
-Se nenhum pacote chegar por minutos, ao consultar a aplicação **rotaciona o
-estado temporal** e retorna o minuto imediatamente anterior ao atual com
-`count = 0` (não houve eventos).
+Vantagens em relação a uma janela fixa:
+
+- **GET idempotente.** `curl` de teste, healthcheck duplicado, debug — nada
+  altera o estado.
+- **Intervalo de coleta livre.** 10 s, 60 s, 5 min: o delta é sempre correto.
+- **Outage do Zabbix não distorce o histórico.** Quando o coletor volta, o
+  primeiro delta cobre todo o intervalo perdido.
+- **Tolerante a perda de pacote de resposta.** A próxima coleta absorve o
+  evento naturalmente.
+
+Quando o `Total` **diminui** (restart sem `state.json` válido), o preprocessing
+`Simple change` do Zabbix descarta o ponto automaticamente.
+
+---
+
+## Persistência
+
+O estado é gravado em um arquivo JSON único (default `/var/lib/contador-udp/state.json`).
+
+- **Snapshot periódico** (default 60 s, configurável por `--persist-interval`).
+  Só escreve se houve mudança desde o último snapshot (*dirty bit*).
+- **Flush no SIGTERM/SIGINT** garante zero perda em restart planejado.
+- **Write atômico:** `os.CreateTemp` + `fsync` + `rename` no mesmo diretório.
+- **Recovery no boot:** carrega `Total`, `PacketsReceived` e `PacketsIgnored`
+  por nome de câmera. Arquivo ausente, vazio ou corrompido **não trava** o
+  boot — apenas loga aviso e começa do zero.
+- **Câmera removida da config:** entrada órfã no disco é logada e ignorada.
+
+Janela máxima de perda em crash não-graceful: o intervalo de `--persist-interval`.
+
+Para **desativar** a persistência basta deixar `--state-file` vazio (default).
+
+Estrutura do arquivo:
+
+```json
+{
+  "version": 1,
+  "saved_at": "2026-05-21T19:38:42Z",
+  "counters": {
+    "cam5000": {
+      "udp_port": 5000,
+      "total": 184523,
+      "packets_received": 901234,
+      "packets_ignored": 0
+    }
+  }
+}
+```
 
 ---
 
@@ -138,14 +190,15 @@ O modo `--active` define a polaridade:
 # build
 go build -o contador_udp_zabbix contador_udp_zabbix.go
 
-# três câmeras nomeadas
+# três câmeras nomeadas, com persistência
 ./contador_udp_zabbix \
   --camera entrada:5000 \
   --camera saida:5001 \
   --camera patio:5002 \
   --http-port 23187 \
-  --bucket-seconds 60 \
   --active high \
+  --state-file ./state.json \
+  --persist-interval 60s \
   --auth-token "meu-token-secreto" \
   --debug
 
@@ -154,11 +207,11 @@ go build -o contador_udp_zabbix contador_udp_zabbix.go
   --port-range 5000-5249 \
   --counter-prefix cam \
   --http-port 23187 \
-  --bucket-seconds 60 \
   --active high \
+  --state-file /var/lib/contador-udp/state.json \
   --auth-token "meu-token-secreto"
 
-# range + filtro de origem
+# range + filtro de origem, sem persistência (--state-file vazio)
 ./contador_udp_zabbix \
   --port-range 5000-5249 \
   --counter-prefix cam \
@@ -177,20 +230,23 @@ go build -o contador_udp_zabbix contador_udp_zabbix.go
 | `--http-host` | `0.0.0.0` | Bind HTTP |
 | `--http-port` | `23187` | Porta HTTP |
 | `--udp-host` | `0.0.0.0` | Bind UDP |
-| `--bucket-seconds` | `60` | Tamanho do bucket em segundos |
 | `--active` | `high` | `high` ou `low` |
 | `--auth-token` | (vazio) | Token de autorização. Vazio = sem auth |
 | `--camera` | — | `nome:porta`, pode repetir |
 | `--port-range` | — | `inicio-fim`, ex: `5000-5249` |
 | `--counter-prefix` | `cam` | Prefixo de nome para `--port-range` |
 | `--allowed-source-cidr` | — | CIDR permitido como origem (pode repetir) |
+| `--state-file` | (vazio) | Arquivo JSON para persistência; vazio = desativa |
+| `--persist-interval` | `60s` | Intervalo entre snapshots quando houver mudança |
+| `--max-source-ips` | `64` | Limite de IPs de origem rastreados por contador |
 | `--debug` | `false` | Loga cada pacote recebido |
 
 Validações executadas no boot:
 
 - nome ou porta duplicados
 - porta inválida / formato inválido
-- `bucket-seconds <= 0`
+- `persist-interval <= 0`
+- `max-source-ips <= 0`
 - `active` diferente de `high`/`low`
 - CIDR inválido
 - nenhuma câmera definida
@@ -212,12 +268,17 @@ token).
 | `GET /health` | JSON | `{"ok": true}` |
 | `GET /identity` | JSON | Configuração efetiva e câmeras |
 | `GET /cameras` | JSON | Lista de câmeras |
-| `GET /zabbix/{camera}/last` | JSON | Último bucket fechado da câmera |
-| `GET /zabbix/{camera}/last/value` | text | Apenas o número (recomendado p/ Zabbix) |
-| `GET /zabbix/ip/{source_ip}/last` | JSON | Todas as portas onde o IP apareceu + count |
-| `GET /zabbix/ip/{source_ip}/last/value` | text | `porta=count` por linha |
+| `GET /zabbix/{camera}/total` | JSON | `total` monotônico da câmera |
+| `GET /zabbix/{camera}/total/value` | text | Apenas o número (recomendado p/ Zabbix) |
+| `GET /zabbix/ip/{source_ip}/total` | JSON | Todas as portas onde o IP apareceu + total |
+| `GET /zabbix/ip/{source_ip}/total/value` | text | `porta=total` por linha |
 | `GET /debug` | JSON | Estado completo de todos os contadores |
 | `GET /debug/{camera}` | JSON | Estado completo de um contador |
+
+As rotas legadas `/zabbix/.../last[/value]` continuam funcionando como
+**alias** para `/total[/value]`. O valor retornado é o mesmo `total`
+monotônico — a semântica do campo mudou em relação à versão de buckets
+fixos, e o Zabbix precisa ter preprocessing **Simple change** configurado.
 
 ### Exemplos
 
@@ -225,60 +286,68 @@ token).
 # saúde
 curl http://SERVIDOR:23187/health
 
-# valor da câmera (recomendado p/ Zabbix)
+# valor da câmera (recomendado p/ Zabbix — número absoluto, monotônico)
 curl -H "Authorization: Bearer meu-token-secreto" \
-  http://SERVIDOR:23187/zabbix/cam5000/last/value
-# => 12
+  http://SERVIDOR:23187/zabbix/cam5000/total/value
+# => 184523
 
 # JSON da câmera
 curl -H "Authorization: Bearer meu-token-secreto" \
-  http://SERVIDOR:23187/zabbix/cam5000/last
+  http://SERVIDOR:23187/zabbix/cam5000/total
 
 # por IP de origem (todos os listeners onde aquele IP apareceu)
 curl -H "Authorization: Bearer meu-token-secreto" \
-  http://SERVIDOR:23187/zabbix/ip/192.168.1.20/last
+  http://SERVIDOR:23187/zabbix/ip/192.168.1.20/total
 
 # por IP em texto puro
 curl -H "Authorization: Bearer meu-token-secreto" \
-  http://SERVIDOR:23187/zabbix/ip/192.168.1.20/last/value
-# => 5000=12
-#    5001=4
+  http://SERVIDOR:23187/zabbix/ip/192.168.1.20/total/value
+# => 5000=184523
+#    5001=  4711
 
 # debug
 curl -H "X-Auth-Token: meu-token-secreto" \
   http://SERVIDOR:23187/debug
 
 # query string (apenas para teste — desencorajado em produção)
-curl "http://SERVIDOR:23187/zabbix/cam5000/last/value?token=meu-token-secreto"
+curl "http://SERVIDOR:23187/zabbix/cam5000/total/value?token=meu-token-secreto"
 ```
 
-#### Resposta de `/zabbix/ip/{ip}/last`
+#### Resposta de `/zabbix/{camera}/total`
+
+```json
+{
+  "ok": true,
+  "camera": "cam5000",
+  "udp_port": 5000,
+  "total": 184523,
+  "packets_received": 901234,
+  "last_seen": "2026-05-21T14:32:01",
+  "last_event_at": "2026-05-21T14:32:00"
+}
+```
+
+#### Resposta de `/zabbix/ip/{ip}/total`
 
 ```json
 {
   "ok": true,
   "source_ip": "192.168.1.20",
-  "bucket_seconds": 60,
   "matches": [
     {
       "camera": "cam5000",
       "udp_port": 5000,
-      "bucket_seconds": 60,
-      "bucket_start_ts": 1778167140,
-      "bucket_end_ts": 1778167200,
-      "bucket_start": "2026-05-07T14:31:00",
-      "bucket_end": "2026-05-07T14:32:00",
-      "count": 12,
-      "total": 350,
-      "packets_received": 900,
-      "last_seen": "2026-05-07T14:32:01"
+      "total": 184523,
+      "packets_received": 901234,
+      "last_seen": "2026-05-21T14:32:01",
+      "last_event_at": "2026-05-21T14:32:00"
     }
   ]
 }
 ```
 
 Se o IP não apareceu em nenhum listener, `matches` vem vazio
-(`/last/value` retorna corpo vazio).
+(`/total/value` retorna corpo vazio).
 
 ---
 
@@ -328,36 +397,58 @@ Se quiser restringir quem pode enviar, use `--allowed-source-cidr`. Isto é
 
 - Tipo: **HTTP Agent**
 - Método: `GET`
-- URL: `http://SERVIDOR:23187/zabbix/cam5000/last/value`
-- Headers: `Authorization: Bearer meu-token-secreto`
+- URL: `http://SERVIDOR:23187/zabbix/cam5000/total/value`
+- Headers: `Authorization: Bearer meu-token-secreto` (apenas se `--auth-token`)
 - Tipo de informação: **Numeric (unsigned)**
-- Intervalo: `60s`
-- Preprocessing: nenhum (resposta já é o número)
+- Intervalo: livre (60 s, 5 min, qualquer valor)
+- **Preprocessing:**
+  1. **Simple change** — entrega o delta entre coletas (carros no período)
 
-A resposta é o **último minuto fechado**, não o minuto atual incompleto —
-isto garante que o Zabbix sempre receba um valor estável.
+> ⚠️ Sem `Simple change` o item armazena o contador absoluto e o gráfico
+> vira uma reta crescente. **Sempre** configure o preprocessing.
+
+Alternativas:
+
+- **Change per second** no lugar de `Simple change`: entrega fluxo
+  instantâneo em carros/segundo. Útil para dashboards de fluxo, mas perde
+  a noção de "carros no período de coleta".
+- **Discard unchanged** após `Simple change`: economiza histórico quando
+  a câmera fica ociosa por longos períodos (madrugada).
+
+### Item dependente a partir do JSON
+
+Se preferir coletar com a rota JSON (ex.: para extrair múltiplos campos):
+
+- Master item: HTTP Agent → `GET /zabbix/cam5000/total`
+- Dependent item para a contagem:
+  1. **JSON Path:** `$.total`
+  2. **Simple change**
 
 ### Por IP de origem (diagnóstico / múltiplas portas)
 
-`/zabbix/ip/{ip}/last` (JSON) é útil para diagnosticar quando várias
+`/zabbix/ip/{ip}/total` (JSON) é útil para diagnosticar quando várias
 câmeras chegam com o mesmo IP público. Para coletar várias portas em uma
 chamada, configure um master item **HTTP Agent** consultando a rota JSON
-e use **dependent items** com preprocessing JSONPath, ou evolua depois
-para LLD.
+e use **dependent items** com preprocessing JSONPath + Simple change.
 
 ---
 
 ## Limitações
 
-- **Apenas o último minuto fechado** é mantido. Se o Zabbix perder uma
-  coleta, aquele minuto se perde.
-- **Sem persistência**: reinício do processo zera contadores.
-- **Sem TLS**: coloque atrás de Nginx/Caddy se precisar de HTTPS.
+- **Perda em crash não-graceful:** até `--persist-interval` segundos de
+  contagem podem se perder (default 60 s). SIGTERM/SIGINT fazem flush
+  final e não perdem nada.
+- **Match no recovery é por nome:** renomear uma câmera no flag (ex:
+  `cam5000` → `entrada_norte`) faz o serviço reiniciar do zero para ela
+  e marcar a entrada antiga como órfã no disco.
+- **Reset do contador descarta o ponto no Zabbix:** restart sem
+  `state.json` válido faz `Total` voltar a zero; o preprocessing
+  `Simple change` ignora o ponto. Para evitar lacuna, garanta que o
+  arquivo de estado esteja preservado entre restarts.
+- **Sem TLS:** coloque atrás de Nginx/Caddy se precisar de HTTPS.
 - **Sem `--min-gap-ms`** nesta versão (intencional).
 - **Sem LLD pronto** para Zabbix (descoberta automática) — pode ser
   evoluído.
-- **Sem graceful shutdown** sofisticado — o processo encerra ao receber
-  sinal e perde o bucket atual.
 
 ---
 
@@ -368,13 +459,11 @@ para LLD.
 3. `net.ListenConfig` para opções avançadas de socket (SO_REUSEPORT etc).
 4. Buffer/channel por câmera para evitar bloqueio em picos.
 5. Exportar métricas Prometheus.
-6. `systemd` service para rodar como daemon.
-7. Persistência opcional em SQLite/PostgreSQL para histórico longo.
-8. Endpoint multi-valor para Zabbix discovery / LLD.
-9. LLD do Zabbix para descoberta automática dos contadores.
-10. Config YAML/JSON (mantendo flags como atalho).
-11. Graceful shutdown com `context` + `signal.Notify`.
-12. Otimização de alocação no parsing para volume muito alto.
-13. Histórico circular em RAM para recuperar coletas perdidas.
-14. Métricas por IP de origem sem comprometer a identidade por porta.
-15. TLS nativo ou Nginx/Caddy na frente.
+6. Endpoint multi-valor para Zabbix discovery / LLD.
+7. LLD do Zabbix para descoberta automática dos contadores.
+8. Config YAML/JSON (mantendo flags como atalho).
+9. Otimização de alocação no parsing para volume muito alto.
+10. Métricas por IP de origem sem comprometer a identidade por porta.
+11. TLS nativo ou Nginx/Caddy na frente.
+12. Match no recovery por `udp_port` (em vez de nome), tornando rename
+    de câmera não-destrutivo.
