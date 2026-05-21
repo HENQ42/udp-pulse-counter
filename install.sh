@@ -24,6 +24,10 @@ readonly INSTALL_DIR="/opt/${APP_NAME}"
 readonly INSTALL_BIN="${INSTALL_DIR}/${BIN_NAME}"
 readonly UNIT_FILE="/etc/systemd/system/${APP_NAME}.service"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-${APP_NAME}.conf"
+# Estado persistente: contagens monotonicas por camera.
+# NAO e removido em reinstalacao para preservar historico.
+readonly STATE_DIR="/var/lib/${APP_NAME}"
+readonly STATE_FILE="${STATE_DIR}/state.json"
 # Diretorios/arquivos de instalacoes antigas (limpeza apenas)
 readonly LEGACY_TOKEN_DIR="/etc/${APP_NAME}"
 readonly LEGACY_TOKEN_FILE="${LEGACY_TOKEN_DIR}/token.env"
@@ -32,11 +36,11 @@ readonly LEGACY_TOKEN_FILE="${LEGACY_TOKEN_DIR}/token.env"
 readonly DEFAULT_HTTP_HOST="127.0.0.1"
 
 # Defaults da aplicacao
-readonly DEFAULT_PORT_RANGE="5000-5049"
+readonly DEFAULT_PORT_RANGE="5000-5249"
 readonly DEFAULT_HTTP_PORT="23187"
-readonly DEFAULT_BUCKET_SECONDS="900"
 readonly DEFAULT_ACTIVE="high"
 readonly DEFAULT_PREFIX="cam"
+readonly DEFAULT_PERSIST_INTERVAL="60s"
 
 # Caminho absoluto da raiz do projeto (onde este script vive)
 readonly PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -148,7 +152,7 @@ detect_service_group() {
 require_paths_exist() {
     log "verificando estrutura de diretorios do sistema..."
     local p
-    for p in /etc /etc/systemd/system /etc/sysctl.d /opt /var/log; do
+    for p in /etc /etc/systemd/system /etc/sysctl.d /opt /var/lib /var/log; do
         [[ -d "${p}" ]] || die "diretorio ausente: ${p}"
     done
     ok "estrutura de diretorios OK"
@@ -258,6 +262,21 @@ install_binary() {
     ok "binario instalado"
 }
 
+# Cria o diretorio de estado e o arquivo (se ainda nao existe), ambos com
+# ownership do usuario do servico. Em reinstalacao NAO recria/zera o
+# state.json — preserva as contagens acumuladas.
+install_state_dir() {
+    log "preparando diretorio de estado em ${STATE_DIR}..."
+    install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${STATE_DIR}"
+    if [[ -f "${STATE_FILE}" ]]; then
+        # Garante ownership correto sem mexer no conteudo.
+        chown "${SERVICE_USER}:${SERVICE_GROUP}" "${STATE_FILE}"
+        ok "estado existente preservado: ${STATE_FILE}"
+    else
+        ok "diretorio de estado criado (state.json sera gerado no primeiro snapshot)"
+    fi
+}
+
 # Em sistemas com SELinux ativo (RHEL/Rocky/Alma/Fedora), aplica os labels
 # default do filesystem nos arquivos recem-instalados. Sem isso, o binario
 # fica com o contexto herdado do build (ex: user_home_t) e o systemd pode
@@ -287,6 +306,7 @@ apply_selinux_labels() {
     restorecon -F "${INSTALL_BIN}"  >/dev/null 2>&1 || true
     restorecon -F "${UNIT_FILE}"    >/dev/null 2>&1 || true
     restorecon -F "${SYSCTL_FILE}"  >/dev/null 2>&1 || true
+    restorecon -RF "${STATE_DIR}"   >/dev/null 2>&1 || true
     ok "labels SELinux aplicados"
 }
 
@@ -320,12 +340,15 @@ ExecStart=${INSTALL_BIN} \\
   --counter-prefix ${DEFAULT_PREFIX} \\
   --http-host ${DEFAULT_HTTP_HOST} \\
   --http-port ${DEFAULT_HTTP_PORT} \\
-  --bucket-seconds ${DEFAULT_BUCKET_SECONDS} \\
-  --active ${DEFAULT_ACTIVE}
+  --active ${DEFAULT_ACTIVE} \\
+  --state-file ${STATE_FILE} \\
+  --persist-interval ${DEFAULT_PERSIST_INTERVAL}
 Restart=always
 RestartSec=3
+# Tempo para o flush final do estado antes de SIGKILL.
+TimeoutStopSec=10
 
-# Hardening basico: nao precisa de privilegio elevado nem escrita em disco.
+# Hardening basico.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -335,6 +358,8 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
+# Permite escrita apenas no diretorio de estado (resto do FS permanece RO).
+ReadWritePaths=${STATE_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -362,11 +387,12 @@ print_summary() {
     ok "instalacao concluida"
     echo
     echo "  Binario        : ${INSTALL_BIN}"
+    echo "  Estado         : ${STATE_FILE} (preservado em reinstalacao)"
     echo "  Unit           : ${UNIT_FILE}"
     echo "  Sysctl         : ${SYSCTL_FILE}"
     echo "  Range UDP      : ${DEFAULT_PORT_RANGE}"
     echo "  HTTP           : ${DEFAULT_HTTP_HOST}:${DEFAULT_HTTP_PORT} (localhost-only, sem auth)"
-    echo "  Prefixo nomes  : ${DEFAULT_PREFIX} -> cam5000..cam5049"
+    echo "  Prefixo nomes  : ${DEFAULT_PREFIX} -> cam5000..cam5249"
     echo
     echo "Comandos uteis:"
     echo "  systemctl status ${APP_NAME}"
@@ -393,6 +419,7 @@ main() {
 
     build_binary
     install_binary
+    install_state_dir
     install_sysctl
     install_unit
     apply_selinux_labels

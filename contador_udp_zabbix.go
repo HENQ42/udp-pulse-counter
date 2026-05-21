@@ -4,9 +4,9 @@
 //
 // - Multiplos listeners UDP, um por camera/porta.
 // - Conta por borda inativo->ativo (transicao).
-// - Agrupa por bucket temporal (default 60s).
-// - Mantem em RAM apenas: bucket atual + ultimo bucket fechado.
-// - Expoe rotas HTTP GET para Zabbix consultar.
+// - Contador monotonico (Total) exposto via HTTP; Zabbix calcula delta com
+//   preprocessing "Simple change" ou "Change per second".
+// - Estado persistido em arquivo JSON; snapshot periodico + flush em SIGTERM.
 // - Suporta token de autorizacao por flag.
 // - Suporta consulta por IP de origem (lista todas as portas onde aquele IP apareceu).
 //
@@ -25,11 +25,15 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -48,16 +52,17 @@ type cameraSpec struct {
 }
 
 type config struct {
-	HTTPHost      string
-	HTTPPort      int
-	UDPHost       string
-	BucketSeconds int
-	ActiveMode    string // high|low
-	AuthToken     string
-	AllowedCIDRs  []*net.IPNet
-	Debug         bool
-	Cameras       []cameraSpec
-	MaxSourceIPs  int // limite por contador
+	HTTPHost        string
+	HTTPPort        int
+	UDPHost         string
+	ActiveMode      string // high|low
+	AuthToken       string
+	AllowedCIDRs    []*net.IPNet
+	Debug           bool
+	Cameras         []cameraSpec
+	MaxSourceIPs    int
+	StateFile       string // vazio = persistencia desativada
+	PersistInterval time.Duration
 }
 
 // ----------------------------------------------------------------------------
@@ -67,21 +72,14 @@ type config struct {
 type Counter struct {
 	mu sync.RWMutex
 
-	Name          string
-	UDPPort       int
-	BucketSeconds int64
+	Name    string
+	UDPPort int
 
-	// bucket atual
-	CurrentBucketStart int64
-	CurrentCount       int64
+	// Contador monotonico de eventos contados (bordas inativo->ativo).
+	// Zabbix obtem o delta via preprocessing.
+	Total int64
 
-	// ultimo bucket fechado
-	LastBucketStart int64
-	LastBucketEnd   int64
-	LastCount       int64
-
-	// totais e estado
-	Total           int64
+	// Diagnostico
 	PacketsReceived int64
 	PacketsIgnored  int64
 
@@ -91,24 +89,17 @@ type Counter struct {
 	PreviousActive bool
 	HasFirstPacket bool
 
-	// mapa bounded de IPs de origem (somente diagnostico).
-	// Tamanho maximo controlado por MaxSourceIPs. Cheio -> evict do mais antigo.
+	// Mapa bounded de IPs de origem (somente diagnostico).
 	SourceIPs    map[string]time.Time
 	MaxSourceIPs int
 }
 
-func newCounter(name string, port int, bucketSeconds int64, maxSourceIPs int) *Counter {
-	now := time.Now().Unix()
-	bs := bucketStart(now, bucketSeconds)
+func newCounter(name string, port int, maxSourceIPs int) *Counter {
 	return &Counter{
-		Name:               name,
-		UDPPort:            port,
-		BucketSeconds:      bucketSeconds,
-		CurrentBucketStart: bs,
-		LastBucketStart:    bs - bucketSeconds, // bucket "anterior" sintetico (count=0)
-		LastBucketEnd:      bs,
-		SourceIPs:          make(map[string]time.Time, maxSourceIPs),
-		MaxSourceIPs:       maxSourceIPs,
+		Name:         name,
+		UDPPort:      port,
+		SourceIPs:    make(map[string]time.Time, maxSourceIPs),
+		MaxSourceIPs: maxSourceIPs,
 	}
 }
 
@@ -135,59 +126,14 @@ func (c *Counter) touchSourceIPLocked(ip string, now time.Time) {
 	c.SourceIPs[ip] = now
 }
 
-func bucketStart(ts int64, bucketSeconds int64) int64 {
-	return (ts / bucketSeconds) * bucketSeconds
-}
-
-// rotateLocked sincroniza o estado temporal.
-// Se ja saimos do CurrentBucketStart, fecha-o como "ultimo bucket" e
-// avanca para o bucket atual. Buckets vazios intermediarios sao
-// representados pelo proprio "ultimo bucket fechado" sendo o imediatamente
-// anterior ao bucket atual com count=0.
-func (c *Counter) rotateLocked(now int64) {
-	bs := bucketStart(now, c.BucketSeconds)
-	if bs == c.CurrentBucketStart {
-		return
-	}
-	// Bucket atual virou bucket fechado.
-	if bs == c.CurrentBucketStart+c.BucketSeconds {
-		// avancou exatamente 1 bucket
-		c.LastBucketStart = c.CurrentBucketStart
-		c.LastBucketEnd = c.CurrentBucketStart + c.BucketSeconds
-		c.LastCount = c.CurrentCount
-	} else {
-		// pulamos varios buckets sem trafego.
-		// O ultimo bucket fechado deve ser o imediatamente anterior ao atual,
-		// com contagem 0 (nao houve eventos).
-		c.LastBucketStart = bs - c.BucketSeconds
-		c.LastBucketEnd = bs
-		c.LastCount = 0
-		// Observacao: o proprio CurrentCount pertencia a um bucket antigo,
-		// mas ja eh historico nao consultavel nesta versao.
-	}
-	c.CurrentBucketStart = bs
-	c.CurrentCount = 0
-}
-
-// SyncTime garante que o counter esteja com bucket atualizado.
-// Pode ser chamado antes de qualquer leitura ou escrita.
-func (c *Counter) SyncTime() {
-	c.mu.Lock()
-	c.rotateLocked(time.Now().Unix())
-	c.mu.Unlock()
-}
-
 // ----------------------------------------------------------------------------
 // Parsing dos pacotes UDP
 // ----------------------------------------------------------------------------
 
-// parsePulsePayload tenta interpretar o payload como um valor de pulso.
-// Retorna 0 ou 1 e ok=true se conseguiu interpretar.
 func parsePulsePayload(data []byte) (int, bool) {
 	if len(data) == 0 {
 		return 0, false
 	}
-	// 1) Tentar texto.
 	s := strings.TrimSpace(strings.ToLower(string(data)))
 	switch s {
 	case "1", "true", "ativo", "active", "high", "alto":
@@ -195,7 +141,6 @@ func parsePulsePayload(data []byte) (int, bool) {
 	case "0", "false", "inativo", "inactive", "low", "baixo":
 		return 0, true
 	}
-	// 2) Tentar binario big-endian de 1, 2, 4, 8 bytes.
 	switch len(data) {
 	case 1:
 		if data[0] != 0 {
@@ -218,7 +163,6 @@ func parsePulsePayload(data []byte) (int, bool) {
 		}
 		return 0, true
 	}
-	// 3) Fallback: qualquer byte diferente de zero -> ativo.
 	for _, b := range data {
 		if b != 0 {
 			return 1, true
@@ -231,7 +175,7 @@ func parsePulsePayload(data []byte) (int, bool) {
 // UDP listener
 // ----------------------------------------------------------------------------
 
-func runUDPListener(cfg *config, c *Counter) error {
+func runUDPListener(cfg *config, c *Counter, dirty *atomic.Bool) error {
 	addr := &net.UDPAddr{IP: net.ParseIP(cfg.UDPHost), Port: c.UDPPort}
 	if addr.IP == nil {
 		addr.IP = net.IPv4zero
@@ -243,14 +187,7 @@ func runUDPListener(cfg *config, c *Counter) error {
 	log.Printf("[UDP] camera=%s listening on %s:%d", c.Name, cfg.UDPHost, c.UDPPort)
 
 	go func() {
-		// Buffer fixo reutilizado: nao alocamos por pacote.
-		// handlePacket roda sincronamente nesta goroutine, entao buf[:n]
-		// pode ser usado direto sem corrida.
 		buf := make([]byte, 2048)
-
-		// Loop com recover por iteracao: um panic no processamento de UM pacote
-		// nao derruba o listener (e nao derruba o processo inteiro).
-		// O socket UDP eh preservado entre iteracoes.
 		for {
 			func() {
 				defer func() {
@@ -264,7 +201,7 @@ func runUDPListener(cfg *config, c *Counter) error {
 					log.Printf("[UDP] camera=%s read error: %v", c.Name, err)
 					return
 				}
-				handlePacket(cfg, c, buf[:n], src)
+				handlePacket(cfg, c, buf[:n], src, dirty)
 			}()
 		}
 	}()
@@ -283,7 +220,7 @@ func sourceAllowed(cfg *config, ip net.IP) bool {
 	return false
 }
 
-func handlePacket(cfg *config, c *Counter, data []byte, src *net.UDPAddr) {
+func handlePacket(cfg *config, c *Counter, data []byte, src *net.UDPAddr, dirty *atomic.Bool) {
 	now := time.Now()
 	srcIP := src.IP.String()
 
@@ -293,8 +230,9 @@ func handlePacket(cfg *config, c *Counter, data []byte, src *net.UDPAddr) {
 				c.Name, c.UDPPort, src.String())
 		}
 		c.mu.Lock()
-		defer c.mu.Unlock()
 		c.PacketsIgnored++
+		c.mu.Unlock()
+		dirty.Store(true)
 		return
 	}
 
@@ -305,35 +243,30 @@ func handlePacket(cfg *config, c *Counter, data []byte, src *net.UDPAddr) {
 				c.Name, c.UDPPort, src.String(), hex.EncodeToString(data))
 		}
 		c.mu.Lock()
-		defer c.mu.Unlock()
 		c.PacketsReceived++
 		c.PacketsIgnored++
 		c.LastPacketAt = now
 		c.touchSourceIPLocked(srcIP, now)
+		c.mu.Unlock()
+		dirty.Store(true)
 		return
 	}
 
-	// Determinar "active" levando em conta active_mode.
 	rawActive := val == 1
 	active := rawActive
 	if cfg.ActiveMode == "low" {
 		active = !rawActive
 	}
 
-	// Secao critica isolada em closure com defer Unlock:
-	// se houver panic aqui dentro, o mutex e liberado antes do panic propagar
-	// para o recover() do listener.
 	status := func() string {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 
-		c.rotateLocked(now.Unix())
 		c.PacketsReceived++
 		c.LastPacketAt = now
 		c.touchSourceIPLocked(srcIP, now)
 
 		if !c.HasFirstPacket {
-			// Apenas sincroniza estado anterior, nao conta.
 			c.PreviousActive = active
 			c.HasFirstPacket = true
 			return "FIRST_PACKET_SYNC"
@@ -341,7 +274,6 @@ func handlePacket(cfg *config, c *Counter, data []byte, src *net.UDPAddr) {
 
 		var s string
 		if active && !c.PreviousActive {
-			c.CurrentCount++
 			c.Total++
 			c.LastEventAt = now
 			s = "COUNTED"
@@ -354,10 +286,165 @@ func handlePacket(cfg *config, c *Counter, data []byte, src *net.UDPAddr) {
 		return s
 	}()
 
+	dirty.Store(true)
+
 	if cfg.Debug {
 		log.Printf("[UDP] camera=%s port=%d src=%s hex=%q val=%d active=%v status=%s",
 			c.Name, c.UDPPort, src.String(), hex.EncodeToString(data), val, active, status)
 	}
+}
+
+// ----------------------------------------------------------------------------
+// Persistencia
+// ----------------------------------------------------------------------------
+
+type persistedCounter struct {
+	UDPPort         int   `json:"udp_port"`
+	Total           int64 `json:"total"`
+	PacketsReceived int64 `json:"packets_received"`
+	PacketsIgnored  int64 `json:"packets_ignored"`
+}
+
+type persistedState struct {
+	Version  int                         `json:"version"`
+	SavedAt  string                      `json:"saved_at"`
+	Counters map[string]persistedCounter `json:"counters"`
+}
+
+// loadState le o arquivo de estado e aplica os totais aos counters que casarem
+// por nome. Counters orfaos no disco (sem correspondencia na config atual) sao
+// apenas logados. Arquivo ausente ou corrompido nao e fatal.
+func loadState(path string, counters []*Counter) {
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			log.Printf("[STATE] arquivo nao encontrado em %s — comecando do zero", path)
+			return
+		}
+		log.Printf("[STATE] AVISO: falha ao ler %s: %v — comecando do zero", path, err)
+		return
+	}
+	var st persistedState
+	if err := json.Unmarshal(data, &st); err != nil {
+		log.Printf("[STATE] AVISO: %s corrompido (%v) — comecando do zero", path, err)
+		return
+	}
+
+	byName := make(map[string]*Counter, len(counters))
+	for _, c := range counters {
+		byName[c.Name] = c
+	}
+
+	restored, orphans := 0, 0
+	for name, p := range st.Counters {
+		c, ok := byName[name]
+		if !ok {
+			orphans++
+			log.Printf("[STATE] camera %q presente no disco mas nao na config — ignorada (total=%d)", name, p.Total)
+			continue
+		}
+		c.mu.Lock()
+		c.Total = p.Total
+		c.PacketsReceived = p.PacketsReceived
+		c.PacketsIgnored = p.PacketsIgnored
+		c.mu.Unlock()
+		restored++
+	}
+	log.Printf("[STATE] carregado de %s (saved_at=%s, restored=%d, orfas=%d)",
+		path, st.SavedAt, restored, orphans)
+}
+
+// saveState escreve o estado de forma atomica: tmp + fsync + rename.
+func saveState(path string, counters []*Counter) error {
+	st := persistedState{
+		Version:  1,
+		SavedAt:  time.Now().UTC().Format(time.RFC3339),
+		Counters: make(map[string]persistedCounter, len(counters)),
+	}
+	for _, c := range counters {
+		c.mu.RLock()
+		st.Counters[c.Name] = persistedCounter{
+			UDPPort:         c.UDPPort,
+			Total:           c.Total,
+			PacketsReceived: c.PacketsReceived,
+			PacketsIgnored:  c.PacketsIgnored,
+		}
+		c.mu.RUnlock()
+	}
+
+	data, err := json.MarshalIndent(&st, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	data = append(data, '\n')
+
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".state-*.json.tmp")
+	if err != nil {
+		return fmt.Errorf("create tmp: %w", err)
+	}
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return fmt.Errorf("write tmp: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return fmt.Errorf("fsync tmp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("close tmp: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		cleanup()
+		return fmt.Errorf("rename: %w", err)
+	}
+	return nil
+}
+
+// runPersister roda em goroutine. Faz snapshot quando dirty=true.
+// Retorna canal para sinalizar shutdown e canal de confirmacao de flush final.
+func runPersister(cfg *config, counters []*Counter, dirty *atomic.Bool) (stop chan struct{}, done chan struct{}) {
+	stop = make(chan struct{})
+	done = make(chan struct{})
+	if cfg.StateFile == "" {
+		close(done)
+		return stop, done
+	}
+
+	go func() {
+		defer close(done)
+		t := time.NewTicker(cfg.PersistInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				if !dirty.CompareAndSwap(true, false) {
+					continue
+				}
+				if err := saveState(cfg.StateFile, counters); err != nil {
+					log.Printf("[STATE] ERRO no snapshot: %v", err)
+					dirty.Store(true)
+				}
+			case <-stop:
+				if err := saveState(cfg.StateFile, counters); err != nil {
+					log.Printf("[STATE] ERRO no flush final: %v", err)
+				} else {
+					log.Printf("[STATE] flush final concluido em %s", cfg.StateFile)
+				}
+				return
+			}
+		}
+	}()
+	return stop, done
 }
 
 // ----------------------------------------------------------------------------
@@ -366,8 +453,8 @@ func handlePacket(cfg *config, c *Counter, data []byte, src *net.UDPAddr) {
 
 type server struct {
 	cfg      *config
-	counters map[string]*Counter // por nome
-	byPort   map[int]*Counter    // por porta
+	counters map[string]*Counter
+	byPort   map[int]*Counter
 }
 
 func newServer(cfg *config, counters []*Counter) *server {
@@ -417,33 +504,22 @@ func unauthorized(w http.ResponseWriter) {
 	writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "unauthorized"})
 }
 
-func fmtTS(ts int64) string {
-	if ts <= 0 {
-		return ""
-	}
-	return time.Unix(ts, 0).Format("2006-01-02T15:04:05")
-}
-
-// snapshotLast retorna os campos do ultimo bucket fechado de um counter.
-func snapshotLast(c *Counter) map[string]any {
-	c.mu.Lock()
-	c.rotateLocked(time.Now().Unix())
+// snapshot retorna o total monotonico do counter.
+func snapshot(c *Counter) map[string]any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	out := map[string]any{
 		"camera":           c.Name,
 		"udp_port":         c.UDPPort,
-		"bucket_seconds":   c.BucketSeconds,
-		"bucket_start_ts":  c.LastBucketStart,
-		"bucket_end_ts":    c.LastBucketEnd,
-		"bucket_start":     fmtTS(c.LastBucketStart),
-		"bucket_end":       fmtTS(c.LastBucketEnd),
-		"count":            c.LastCount,
 		"total":            c.Total,
 		"packets_received": c.PacketsReceived,
 	}
 	if !c.LastPacketAt.IsZero() {
 		out["last_seen"] = c.LastPacketAt.Format("2006-01-02T15:04:05")
 	}
-	c.mu.Unlock()
+	if !c.LastEventAt.IsZero() {
+		out["last_event_at"] = c.LastEventAt.Format("2006-01-02T15:04:05")
+	}
 	return out
 }
 
@@ -483,10 +559,11 @@ func (s *server) handleIdentity(w http.ResponseWriter, r *http.Request) {
 		"http_host":            s.cfg.HTTPHost,
 		"http_port":            s.cfg.HTTPPort,
 		"udp_host":             s.cfg.UDPHost,
-		"bucket_seconds":       s.cfg.BucketSeconds,
 		"active_mode":          s.cfg.ActiveMode,
 		"auth_enabled":         s.cfg.AuthToken != "",
 		"allowed_source_cidrs": cidrs,
+		"state_file":           s.cfg.StateFile,
+		"persist_interval":     s.cfg.PersistInterval.String(),
 		"cameras":              cams,
 	})
 }
@@ -509,8 +586,13 @@ func (s *server) handleCameras(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cameras": cams})
 }
 
-// /zabbix/{camera}/last  e /zabbix/{camera}/last/value
-// /zabbix/ip/{ip}/last   e /zabbix/ip/{ip}/last/value
+// /zabbix/{camera}/total  e /zabbix/{camera}/total/value
+// /zabbix/ip/{ip}/total   e /zabbix/ip/{ip}/total/value
+//
+// Rotas legadas /zabbix/{camera}/last[/value] continuam funcionando e retornam
+// o mesmo total (sao alias) — para nao quebrar templates Zabbix existentes
+// que ainda apontem para "last". A semantica do valor mudou: agora e o
+// contador monotonico; o Zabbix deve usar preprocessing "Simple change".
 func (s *server) handleZabbix(w http.ResponseWriter, r *http.Request) {
 	if !s.checkAuth(r) {
 		unauthorized(w)
@@ -524,8 +606,7 @@ func (s *server) handleZabbix(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if parts[0] == "ip" {
-		// /zabbix/ip/{ip}/last [/value]
-		if len(parts) < 3 || parts[2] != "last" {
+		if len(parts) < 3 || (parts[2] != "total" && parts[2] != "last") {
 			http.NotFound(w, r)
 			return
 		}
@@ -535,13 +616,12 @@ func (s *server) handleZabbix(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		valueOnly := len(parts) >= 4 && parts[3] == "value"
-		s.handleIPLast(w, ipStr, valueOnly)
+		s.handleIPTotal(w, ipStr, valueOnly)
 		return
 	}
 
-	// /zabbix/{camera}/last [/value]
 	camName := parts[0]
-	if parts[1] != "last" {
+	if parts[1] != "total" && parts[1] != "last" {
 		http.NotFound(w, r)
 		return
 	}
@@ -555,18 +635,17 @@ func (s *server) handleZabbix(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "camera not found"})
 		return
 	}
-	snap := snapshotLast(c)
+	snap := snapshot(c)
 	if valueOnly {
-		writeText(w, http.StatusOK, strconv.FormatInt(snap["count"].(int64), 10))
+		writeText(w, http.StatusOK, strconv.FormatInt(snap["total"].(int64), 10))
 		return
 	}
 	snap["ok"] = true
 	writeJSON(w, http.StatusOK, snap)
 }
 
-func (s *server) handleIPLast(w http.ResponseWriter, ip string, valueOnly bool) {
+func (s *server) handleIPTotal(w http.ResponseWriter, ip string, valueOnly bool) {
 	matches := []map[string]any{}
-	// percorre todos counters; cada counter tem sua propria lista de SourceIPs vistos
 	for _, c := range s.counters {
 		c.mu.RLock()
 		_, seen := c.SourceIPs[ip]
@@ -574,8 +653,7 @@ func (s *server) handleIPLast(w http.ResponseWriter, ip string, valueOnly bool) 
 		if !seen {
 			continue
 		}
-		snap := snapshotLast(c)
-		matches = append(matches, snap)
+		matches = append(matches, snapshot(c))
 	}
 	sort.Slice(matches, func(i, j int) bool {
 		return matches[i]["udp_port"].(int) < matches[j]["udp_port"].(int)
@@ -586,17 +664,16 @@ func (s *server) handleIPLast(w http.ResponseWriter, ip string, valueOnly bool) 
 		for _, m := range matches {
 			sb.WriteString(strconv.Itoa(m["udp_port"].(int)))
 			sb.WriteString("=")
-			sb.WriteString(strconv.FormatInt(m["count"].(int64), 10))
+			sb.WriteString(strconv.FormatInt(m["total"].(int64), 10))
 			sb.WriteString("\n")
 		}
 		writeText(w, http.StatusOK, sb.String())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":             true,
-		"source_ip":      ip,
-		"bucket_seconds": s.cfg.BucketSeconds,
-		"matches":        matches,
+		"ok":        true,
+		"source_ip": ip,
+		"matches":   matches,
 	})
 }
 
@@ -627,27 +704,21 @@ func (s *server) handleDebug(w http.ResponseWriter, r *http.Request) {
 }
 
 func debugSnapshot(c *Counter) map[string]any {
-	c.mu.Lock()
-	c.rotateLocked(time.Now().Unix())
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	ips := map[string]string{}
 	for ip, t := range c.SourceIPs {
 		ips[ip] = t.Format("2006-01-02T15:04:05")
 	}
 	out := map[string]any{
-		"name":                 c.Name,
-		"udp_port":             c.UDPPort,
-		"bucket_seconds":       c.BucketSeconds,
-		"current_bucket_start": fmtTS(c.CurrentBucketStart),
-		"current_count":        c.CurrentCount,
-		"last_bucket_start":    fmtTS(c.LastBucketStart),
-		"last_bucket_end":      fmtTS(c.LastBucketEnd),
-		"last_count":           c.LastCount,
-		"total":                c.Total,
-		"packets_received":     c.PacketsReceived,
-		"packets_ignored":      c.PacketsIgnored,
-		"previous_active":      c.PreviousActive,
-		"has_first_packet":     c.HasFirstPacket,
-		"source_ips":           ips,
+		"name":             c.Name,
+		"udp_port":         c.UDPPort,
+		"total":            c.Total,
+		"packets_received": c.PacketsReceived,
+		"packets_ignored":  c.PacketsIgnored,
+		"previous_active":  c.PreviousActive,
+		"has_first_packet": c.HasFirstPacket,
+		"source_ips":       ips,
 	}
 	if !c.LastPacketAt.IsZero() {
 		out["last_packet_at"] = c.LastPacketAt.Format("2006-01-02T15:04:05")
@@ -655,7 +726,6 @@ func debugSnapshot(c *Counter) map[string]any {
 	if !c.LastEventAt.IsZero() {
 		out["last_event_at"] = c.LastEventAt.Format("2006-01-02T15:04:05")
 	}
-	c.mu.Unlock()
 	return out
 }
 
@@ -746,11 +816,12 @@ func main() {
 	httpHost := flag.String("http-host", "0.0.0.0", "IP de bind do servidor HTTP")
 	httpPort := flag.Int("http-port", 23187, "porta HTTP")
 	udpHost := flag.String("udp-host", "0.0.0.0", "IP de bind dos listeners UDP")
-	bucketSeconds := flag.Int("bucket-seconds", 60, "tamanho do periodo de agrupamento em segundos")
 	active := flag.String("active", "high", "modo do estado ativo: high|low")
 	authToken := flag.String("auth-token", "", "token de autorizacao para rotas HTTP (vazio = sem auth)")
 	debug := flag.Bool("debug", false, "logs detalhados de cada pacote UDP")
 	maxSourceIPs := flag.Int("max-source-ips", 64, "limite de IPs de origem rastreados por contador (eviction do mais antigo)")
+	stateFile := flag.String("state-file", "", "arquivo JSON para persistir contadores (vazio = desativado)")
+	persistInterval := flag.Duration("persist-interval", 60*time.Second, "intervalo entre snapshots quando houver mudanca (ex: 60s)")
 
 	flag.Var(&cameraFlags, "camera", "camera no formato nome:porta (pode repetir)")
 	flag.Var(&cidrFlags, "allowed-source-cidr", "CIDR permitido como origem UDP (pode repetir)")
@@ -759,14 +830,14 @@ func main() {
 
 	flag.Parse()
 
-	if *bucketSeconds <= 0 {
-		fatal("bucket-seconds deve ser > 0")
-	}
 	if *maxSourceIPs <= 0 {
 		fatal("max-source-ips deve ser > 0")
 	}
 	if *active != "high" && *active != "low" {
 		fatal("active deve ser high ou low")
+	}
+	if *persistInterval <= 0 {
+		fatal("persist-interval deve ser > 0")
 	}
 
 	cams, err := parseCameras(cameraFlags)
@@ -791,28 +862,37 @@ func main() {
 	}
 
 	cfg := &config{
-		HTTPHost:      *httpHost,
-		HTTPPort:      *httpPort,
-		UDPHost:       *udpHost,
-		BucketSeconds: *bucketSeconds,
-		ActiveMode:    *active,
-		AuthToken:     *authToken,
-		AllowedCIDRs:  cidrs,
-		Debug:         *debug,
-		Cameras:       cams,
-		MaxSourceIPs:  *maxSourceIPs,
+		HTTPHost:        *httpHost,
+		HTTPPort:        *httpPort,
+		UDPHost:         *udpHost,
+		ActiveMode:      *active,
+		AuthToken:       *authToken,
+		AllowedCIDRs:    cidrs,
+		Debug:           *debug,
+		Cameras:         cams,
+		MaxSourceIPs:    *maxSourceIPs,
+		StateFile:       *stateFile,
+		PersistInterval: *persistInterval,
 	}
 
-	log.Printf("[CFG] bucket_seconds=%d active=%s auth_enabled=%v", cfg.BucketSeconds, cfg.ActiveMode, cfg.AuthToken != "")
+	log.Printf("[CFG] active=%s auth_enabled=%v state_file=%q persist_interval=%s",
+		cfg.ActiveMode, cfg.AuthToken != "", cfg.StateFile, cfg.PersistInterval)
 	if portRange != "" {
 		log.Printf("[CFG] port_range=%s counter_prefix=%s", portRange, prefix)
 	}
 
 	counters := []*Counter{}
 	for _, cs := range cams {
-		c := newCounter(cs.Name, cs.Port, int64(cfg.BucketSeconds), cfg.MaxSourceIPs)
-		counters = append(counters, c)
-		if err := runUDPListener(cfg, c); err != nil {
+		counters = append(counters, newCounter(cs.Name, cs.Port, cfg.MaxSourceIPs))
+	}
+
+	loadState(cfg.StateFile, counters)
+
+	var dirty atomic.Bool
+	stopPersist, donePersist := runPersister(cfg, counters, &dirty)
+
+	for _, c := range counters {
+		if err := runUDPListener(cfg, c, &dirty); err != nil {
 			fatal(err.Error())
 		}
 	}
@@ -827,15 +907,28 @@ func main() {
 	mux.HandleFunc("/debug/", srv.handleDebug)
 
 	addr := fmt.Sprintf("%s:%d", cfg.HTTPHost, cfg.HTTPPort)
-	log.Printf("[HTTP] Listening on %s", addr)
 	httpSrv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+
+	// Shutdown handler: SIGTERM/SIGINT -> sinaliza persister para flush final.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		s := <-sigs
+		log.Printf("[SYS] sinal recebido: %s — encerrando", s)
+		close(stopPersist)
+		<-donePersist
+		_ = httpSrv.Close()
+	}()
+
+	log.Printf("[HTTP] Listening on %s", addr)
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fatal(err.Error())
 	}
+	<-donePersist
 }
 
 func fatal(msg string) {

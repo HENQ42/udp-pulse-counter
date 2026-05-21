@@ -149,9 +149,9 @@ go build -o contador_udp_zabbix contador_udp_zabbix.go
   --auth-token "meu-token-secreto" \
   --debug
 
-# range de portas (gera cam5000..cam5049)
+# range de portas (gera cam5000..cam5249)
 ./contador_udp_zabbix \
-  --port-range 5000-5049 \
+  --port-range 5000-5249 \
   --counter-prefix cam \
   --http-port 23187 \
   --bucket-seconds 60 \
@@ -160,7 +160,7 @@ go build -o contador_udp_zabbix contador_udp_zabbix.go
 
 # range + filtro de origem
 ./contador_udp_zabbix \
-  --port-range 5000-5049 \
+  --port-range 5000-5249 \
   --counter-prefix cam \
   --http-port 23187 \
   --auth-token "meu-token-secreto" \
@@ -181,7 +181,7 @@ go build -o contador_udp_zabbix contador_udp_zabbix.go
 | `--active` | `high` | `high` ou `low` |
 | `--auth-token` | (vazio) | Token de autorização. Vazio = sem auth |
 | `--camera` | — | `nome:porta`, pode repetir |
-| `--port-range` | — | `inicio-fim`, ex: `5000-5049` |
+| `--port-range` | — | `inicio-fim`, ex: `5000-5249` |
 | `--counter-prefix` | `cam` | Prefixo de nome para `--port-range` |
 | `--allowed-source-cidr` | — | CIDR permitido como origem (pode repetir) |
 | `--debug` | `false` | Loga cada pacote recebido |
