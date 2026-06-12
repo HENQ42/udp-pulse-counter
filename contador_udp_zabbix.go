@@ -628,6 +628,23 @@ func (s *server) handleZabbix(w http.ResponseWriter, r *http.Request) {
 	valueOnly := len(parts) >= 3 && parts[2] == "value"
 	c, ok := s.counters[camName]
 	if !ok {
+		// Dispositivos sem contagem de veiculo sao configurados no Zabbix com a
+		// macro de porta = 0. Quando o identificador pedido representa a porta 0
+		// (ex: "cam0" ou "0"), respondemos 0 em vez de 404. Nenhuma camera real
+		// existe na porta 0, entao isso nao mascara contadores legitimos.
+		if isZeroPortName(camName) {
+			if valueOnly {
+				writeText(w, http.StatusOK, "0")
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":       true,
+				"camera":   camName,
+				"udp_port": 0,
+				"total":    int64(0),
+			})
+			return
+		}
 		if valueOnly {
 			writeText(w, http.StatusNotFound, "")
 			return
@@ -642,6 +659,23 @@ func (s *server) handleZabbix(w http.ResponseWriter, r *http.Request) {
 	}
 	snap["ok"] = true
 	writeJSON(w, http.StatusOK, snap)
+}
+
+// isZeroPortName reporta se o identificador pedido representa a porta 0.
+// Considera o bloco de digitos no final do nome (ex: "cam0", "porta0", "0").
+// Se nao houver digito no final, ou o valor numerico for diferente de 0,
+// retorna false.
+func isZeroPortName(name string) bool {
+	i := len(name)
+	for i > 0 && name[i-1] >= '0' && name[i-1] <= '9' {
+		i--
+	}
+	digits := name[i:]
+	if digits == "" {
+		return false
+	}
+	n, err := strconv.Atoi(digits)
+	return err == nil && n == 0
 }
 
 func (s *server) handleIPTotal(w http.ResponseWriter, ip string, valueOnly bool) {
